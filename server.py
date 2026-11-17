@@ -37,7 +37,7 @@ import httpx
 from PIL import Image
 from mcp.server.fastmcp import FastMCP
 from starlette.requests import Request
-from starlette.responses import FileResponse, JSONResponse, PlainTextResponse
+from starlette.responses import FileResponse, JSONResponse, PlainTextResponse, RedirectResponse
 
 TOKEN = os.environ.get("MCP_TOKEN") or "dev"
 PORT = int(os.environ.get("PORT", "8000"))
@@ -418,6 +418,82 @@ async def saude(_: Request):
     return JSONResponse({"ok": True, "servico": "Fabrica de Videos", "ffmpeg": bool(shutil.which("ffmpeg"))})
 
 
+# --------------------------------------------------------------------------- login OAuth automatico
+# O botao "Vincular" do claude.ai sempre faz um login OAuth. Este servidor aprova sozinho,
+# sem tela: quem protege o acesso e o MCP_TOKEN que ja esta na URL do conector.
+
+def _base(req: Request) -> str:
+    return PUBLIC_URL if not PUBLIC_URL.startswith("http://localhost") else str(req.base_url).rstrip("/")
+
+
+@mcp.custom_route("/.well-known/oauth-protected-resource", methods=["GET"])
+@mcp.custom_route("/.well-known/oauth-protected-resource/{resto:path}", methods=["GET"])
+async def oauth_recurso(req: Request):
+    b = _base(req)
+    return JSONResponse({"resource": f"{b}/{TOKEN}/mcp", "authorization_servers": [b],
+                         "bearer_methods_supported": ["header"]})
+
+
+@mcp.custom_route("/.well-known/oauth-authorization-server", methods=["GET"])
+@mcp.custom_route("/.well-known/oauth-authorization-server/{resto:path}", methods=["GET"])
+@mcp.custom_route("/.well-known/openid-configuration", methods=["GET"])
+async def oauth_servidor(req: Request):
+    b = _base(req)
+    return JSONResponse({
+        "issuer": b,
+        "authorization_endpoint": f"{b}/authorize",
+        "token_endpoint": f"{b}/token",
+        "registration_endpoint": f"{b}/register",
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code", "refresh_token"],
+        "code_challenge_methods_supported": ["S256"],
+        "token_endpoint_auth_methods_supported": ["none", "client_secret_post", "client_secret_basic"],
+        "scopes_supported": ["mcp"],
+    })
+
+
+@mcp.custom_route("/register", methods=["POST"])
+async def oauth_registro(req: Request):
+    try:
+        dados = await req.json()
+    except Exception:  # noqa: BLE001
+        dados = {}
+    return JSONResponse({
+        "client_id": secrets.token_hex(16),
+        "client_id_issued_at": int(time.time()),
+        "redirect_uris": dados.get("redirect_uris", []),
+        "client_name": dados.get("client_name", "cliente"),
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+    }, status_code=201)
+
+
+@mcp.custom_route("/authorize", methods=["GET"])
+async def oauth_autorizar(req: Request):
+    q = req.query_params
+    destino = q.get("redirect_uri", "")
+    if not destino.startswith("https://") and not destino.startswith("http://localhost"):
+        return PlainTextResponse("redirect_uri invalido", 400)
+    from urllib.parse import urlencode
+    params = {"code": secrets.token_urlsafe(24)}
+    if q.get("state"):
+        params["state"] = q["state"]
+    sep = "&" if "?" in destino else "?"
+    return RedirectResponse(f"{destino}{sep}{urlencode(params)}", status_code=302)
+
+
+@mcp.custom_route("/token", methods=["POST"])
+async def oauth_token(_: Request):
+    return JSONResponse({
+        "access_token": secrets.token_urlsafe(32),
+        "token_type": "Bearer",
+        "expires_in": 60 * 60 * 24 * 365,
+        "refresh_token": secrets.token_urlsafe(32),
+        "scope": "mcp",
+    }, headers={"Cache-Control": "no-store"})
+
+
 def _limpar_antigos() -> None:
     """Apaga trabalhos com mais de 2 dias para nao lotar o disco."""
     limite = time.time() - 2 * 86400
@@ -428,5 +504,5 @@ def _limpar_antigos() -> None:
 
 if __name__ == "__main__":
     _limpar_antigos()
-    print(f"Conector MCP: {PUBLIC_URL}/{TOKEN}/mcp")
+    print(f"Servidor no ar em {PUBLIC_URL} (conector: {PUBLIC_URL}/<MCP_TOKEN>/mcp)")
     mcp.run(transport="streamable-http")
