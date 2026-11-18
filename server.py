@@ -323,8 +323,21 @@ def _ass(blocos: list[dict], w: int, h: int, estilo: str) -> str:
     return "\n".join(linhas) + "\n"
 
 
+def _st(job_id: str, **kw) -> None:
+    """Atualiza o andamento e grava em disco, para sobreviver a um reinicio do servidor."""
+    _status[job_id].update(kw)
+    try:
+        (DADOS / job_id / "status.json").write_text(json.dumps(_status[job_id]), "utf-8")
+    except OSError:
+        pass
+
+
+# Limita threads do ffmpeg/x264: sem isso o x264 abre dezenas de threads (conta os nucleos
+# da maquina hospedeira) e estoura os 512 MB do plano gratis do Render.
+THREADS = os.environ.get("THREADS_FFMPEG", "2")
+
+
 def _renderizar(job_id: str, formato: str, estilo: str, movimento: bool) -> None:
-    st = _status[job_id]
     try:
         pasta = DADOS / job_id
         meta = _ler_meta(pasta)
@@ -337,43 +350,43 @@ def _renderizar(job_id: str, formato: str, estilo: str, movimento: bool) -> None
         # 1) um clipe por cena (imagem cobrindo o quadro + zoom lento)
         clipes = []
         for n, t in enumerate(tempos):
-            st.update(etapa=f"Cena {n + 1} de {len(tempos)}", progresso=int(80 * n / len(tempos)))
+            _st(job_id, etapa=f"Cena {n + 1} de {len(tempos)}", progresso=int(80 * n / len(tempos)))
             dur = (t["fim_ms"] - t["inicio_ms"]) / 1000
             quadros = max(1, round(dur * FPS))
             img = meta["imagens"][str(t["cena"])]
             cobrir = f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},setsar=1"
             if movimento:
                 z = "min(zoom+0.0007,1.15)" if n % 2 == 0 else "if(eq(on,0),1.15,max(zoom-0.0007,1))"
-                vf = (f"scale={w * 3 // 2 // 2 * 2}:{h * 3 // 2 // 2 * 2}:force_original_aspect_ratio=increase,crop={w * 3 // 2 // 2 * 2}:{h * 3 // 2 // 2 * 2},"
+                vf = (f"scale={w * 5 // 4 // 2 * 2}:{h * 5 // 4 // 2 * 2}:force_original_aspect_ratio=increase,crop={w * 5 // 4 // 2 * 2}:{h * 5 // 4 // 2 * 2},"
                       f"zoompan=z='{z}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={quadros}:s={w}x{h}:fps={FPS},setsar=1")
             else:
                 vf = cobrir + f",fps={FPS}"
             saida = f"clipe_{n:02}.mp4"
             subprocess.run(
-                ["ffmpeg", "-y", "-loglevel", "error", "-loop", "1", "-i", img, "-vf", vf, "-frames:v", str(quadros),
-                 "-c:v", "libx264", "-preset", PRESET, "-pix_fmt", "yuv420p", "-r", str(FPS), saida],
+                ["ffmpeg", "-y", "-loglevel", "error", "-filter_threads", "1", "-loop", "1", "-i", img, "-vf", vf, "-frames:v", str(quadros),
+                 "-c:v", "libx264", "-preset", PRESET, "-threads", THREADS, "-pix_fmt", "yuv420p", "-r", str(FPS), saida],
                 cwd=pasta, check=True,
             )
             clipes.append(saida)
 
         # 2) junta clipes, coloca a narracao e queima a legenda
-        st.update(etapa="Juntando e legendando", progresso=85)
+        _st(job_id, etapa="Juntando e legendando", progresso=85)
         (pasta / "lista.txt").write_text("".join(f"file '{c}'\n" for c in clipes), "utf-8")
         (pasta / "legendas.ass").write_text(_ass(meta["blocos"], w, h, estilo), "utf-8")
         filtro = "subtitles=legendas.ass" if estilo != "sem" else "null"
         subprocess.run(
             ["ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", "lista.txt",
-             "-i", "narracao.mp3", "-vf", filtro, "-c:v", "libx264", "-preset", PRESET, "-crf", "21",
+             "-i", "narracao.mp3", "-filter_threads", "1", "-vf", filtro, "-c:v", "libx264", "-preset", PRESET, "-threads", THREADS, "-crf", "21",
              "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k", "-shortest", "-movflags", "+faststart", "video.mp4"],
             cwd=pasta, check=True,
         )
         for c in clipes:
             (pasta / c).unlink(missing_ok=True)
-        st.update(status="pronto", etapa="Pronto", progresso=100, url=_url(job_id, "video.mp4"))
+        _st(job_id, status="pronto", etapa="Pronto", progresso=100, url=_url(job_id, "video.mp4"))
     except subprocess.CalledProcessError as e:
-        st.update(status="erro", etapa="Erro no ffmpeg", erro=str(e))
+        _st(job_id, status="erro", etapa="Erro no ffmpeg", erro=str(e))
     except Exception as e:  # noqa: BLE001
-        st.update(status="erro", etapa="Erro", erro=str(e))
+        _st(job_id, status="erro", etapa="Erro", erro=str(e))
 
 
 @mcp.tool()
@@ -388,7 +401,8 @@ async def renderizar_video(
     _pasta(job_id)
     if _status.get(job_id, {}).get("status") == "renderizando":
         return _status[job_id]
-    _status[job_id] = {"status": "renderizando", "etapa": "Preparando", "progresso": 0}
+    _status[job_id] = {}
+    _st(job_id, status="renderizando", etapa="Preparando", progresso=0)
     threading.Thread(target=_renderizar, args=(job_id, formato, estilo_legenda, movimento), daemon=True).start()
     return _status[job_id]
 
@@ -396,8 +410,18 @@ async def renderizar_video(
 @mcp.tool()
 async def status_video(job_id: str) -> dict:
     """Mostra o andamento da montagem do video. Quando status = "pronto", traz o link do MP4."""
-    _pasta(job_id)
-    return _status.get(job_id, {"status": "parado", "etapa": "Nao iniciado", "progresso": 0})
+    pasta = _pasta(job_id)
+    if job_id in _status:
+        return _status[job_id]
+    arq = pasta / "status.json"
+    if arq.exists():
+        salvo = json.loads(arq.read_text("utf-8"))
+        if salvo.get("status") == "renderizando":
+            return {"status": "erro", "etapa": "Servidor reiniciou",
+                    "erro": "O servidor reiniciou no meio da montagem (o plano gratis tem pouca memoria). "
+                            "Clique em Montar video de novo."}
+        return salvo
+    return {"status": "parado", "etapa": "Nao iniciado", "progresso": 0}
 
 
 # --------------------------------------------------------------------------- rotas HTTP
